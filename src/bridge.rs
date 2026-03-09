@@ -1,4 +1,4 @@
-use std::io::{self, ErrorKind};
+use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -236,10 +236,7 @@ fn join_copy_thread(
     handle: thread::JoinHandle<io::Result<()>>,
     label: &str,
 ) -> io::Result<io::Result<()>> {
-    handle.join().map_err(|_| {
-        io::Error::new(
-            ErrorKind::Other,
-            format!("bridge thread panicked while copying {label}"),
-        )
-    })
+    handle
+        .join()
+        .map_err(|_| io::Error::other(format!("bridge thread panicked while copying {label}")))
 }

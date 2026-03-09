@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Build release binaries
+        run: cargo build --locked --release --bins
+
+  package:
+    name: Package (${{ matrix.name }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - lint
+      - test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            archive: mtcp-rs-linux-x86_64.tar.gz
+            client_bin: client
+            remote_bin: remote
+          - name: windows-x86_64
+            os: windows-latest
+            archive: mtcp-rs-windows-x86_64.zip
+            client_bin: client.exe
+            remote_bin: remote.exe
+          - name: macos-x86_64
+            os: macos-13
+            archive: mtcp-rs-macos-x86_64.tar.gz
+            client_bin: client
+            remote_bin: remote
+          - name: macos-arm64
+            os: macos-14
+            archive: mtcp-rs-macos-arm64.tar.gz
+            client_bin: client
+            remote_bin: remote
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --locked --release --bins
+
+      - name: Package release archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eux
+          mkdir package
+          cp "target/release/${{ matrix.client_bin }}" package/
+          cp "target/release/${{ matrix.remote_bin }}" package/
+          cp README.md LICENSE package/
+          tar -czf "${{ matrix.archive }}" -C package .
+
+      - name: Package release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item "target/release/${{ matrix.client_bin }}" package/
+          Copy-Item "target/release/${{ matrix.remote_bin }}" package/
+          Copy-Item README.md package/
+          Copy-Item LICENSE package/
+          Compress-Archive -Path package/* -DestinationPath "${{ matrix.archive }}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Flatten release assets
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p dist
+          find release-assets -type f -maxdepth 2 -exec cp {} dist/ \;
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          make_latest: true

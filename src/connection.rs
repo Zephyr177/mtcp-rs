@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use crate::protocol::{
 };
 
 const WRITE_CHANNEL_DEPTH: usize = 64;
+const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct MSocket {
@@ -420,7 +421,19 @@ fn writer_loop(
     conn: Arc<SubConn>,
     receiver: Receiver<WriteMsg>,
 ) {
-    while let Ok(msg) = receiver.recv() {
+    loop {
+        let msg = match receiver.recv_timeout(WRITER_POLL_INTERVAL) {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Timeout) => {
+                if !conn.is_alive() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    break;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
         match msg {
             WriteMsg::Frame(frame) => {
                 let frame_len = frame.len();
@@ -561,4 +574,49 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MSocket;
+    use std::io::{self, Read};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn peer_fin_closes_writer_clone_and_releases_socket() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let client = TcpStream::connect(addr)?;
+        let (mut server, _) = listener.accept()?;
+        server.set_read_timeout(Some(Duration::from_millis(200)))?;
+
+        let socket = MSocket::from_server(1);
+        socket.attach_stream(client, 1)?;
+
+        server.shutdown(Shutdown::Write)?;
+
+        let mut buf = [0u8; 1];
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            match server.read(&mut buf) {
+                Ok(0) => break,
+                Ok(bytes) => panic!("unexpected payload after FIN: {bytes}"),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) && Instant::now() < deadline =>
+                {
+                    continue;
+                }
+                Err(err) => panic!("peer never observed EOF: {err}"),
+            }
+        }
+
+        socket.wait_closed();
+        Ok(())
+    }
 }

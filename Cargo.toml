@@ -1,0 +1,16 @@
+[package]
+name = "mtcp-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mtcp_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "remote"
+path = "src/bin/remote.rs"

@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -200,43 +201,96 @@ fn bridge_tcp_and_mtcp(stream: TcpStream, socket: MSocket) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
 
     let mut tcp_reader = stream.try_clone()?;
-    let mut tcp_writer = stream;
+    let mut tcp_writer = stream.try_clone()?;
+    let tcp_control = stream;
     let mut mtcp_writer = socket.clone();
     let mut mtcp_reader = socket.clone();
+    let (result_tx, result_rx) = mpsc::sync_channel(2);
 
-    let forward = thread::spawn(move || -> io::Result<()> {
+    let forward_tx = result_tx.clone();
+    let forward = thread::spawn(move || {
         let result = io::copy(&mut tcp_reader, &mut mtcp_writer);
         let _ = mtcp_writer.shutdown_write();
-        result.map(|_| ())
+        let _ = forward_tx.send(result.map(|_| ()));
     });
 
-    let backward = thread::spawn(move || -> io::Result<()> {
+    let backward = thread::spawn(move || {
         let result = io::copy(&mut mtcp_reader, &mut tcp_writer);
         let _ = tcp_writer.shutdown(Shutdown::Write);
-        result.map(|_| ())
+        let _ = result_tx.send(result.map(|_| ()));
     });
 
-    let forward_result = join_copy_thread(forward, "tcp -> mtcp")?;
-    let backward_result = join_copy_thread(backward, "mtcp -> tcp")?;
+    let first_result = result_rx.recv().map_err(|_| {
+        io::Error::other("bridge copy threads exited before reporting their status")
+    })?;
+    let mut error = first_result.err();
 
-    if forward_result.is_err() {
+    if error.is_some() {
         socket.close();
-        return forward_result;
+        let _ = tcp_control.shutdown(Shutdown::Both);
     }
 
-    if backward_result.is_err() {
-        socket.close();
-        return backward_result;
+    let second_result = result_rx.recv().map_err(|_| {
+        io::Error::other("bridge copy threads exited before reporting their status")
+    })?;
+    if error.is_none() {
+        error = second_result.err();
     }
 
-    Ok(())
+    join_copy_thread(forward, "tcp -> mtcp")?;
+    join_copy_thread(backward, "mtcp -> tcp")?;
+
+    match error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
-fn join_copy_thread(
-    handle: thread::JoinHandle<io::Result<()>>,
-    label: &str,
-) -> io::Result<io::Result<()>> {
+fn join_copy_thread(handle: thread::JoinHandle<()>, label: &str) -> io::Result<()> {
     handle
         .join()
         .map_err(|_| io::Error::other(format!("bridge thread panicked while copying {label}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bridge_tcp_and_mtcp;
+    use crate::connection::MSocket;
+    use std::io::{self, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn bridge_returns_when_mtcp_side_errors() -> io::Result<()> {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0")?;
+        let tcp_addr = tcp_listener.local_addr()?;
+        let app_side = TcpStream::connect(tcp_addr)?;
+        let (bridge_side, _) = tcp_listener.accept()?;
+
+        let mtcp_listener = TcpListener::bind("127.0.0.1:0")?;
+        let mtcp_addr = mtcp_listener.local_addr()?;
+        let mtcp_client = TcpStream::connect(mtcp_addr)?;
+        let (mut mtcp_peer, _) = mtcp_listener.accept()?;
+
+        let socket = MSocket::from_server(7);
+        socket.attach_stream(mtcp_client, 1)?;
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = tx.send(bridge_tcp_and_mtcp(bridge_side, socket));
+        });
+
+        mtcp_peer.write_all(&[0, 1, 0])?;
+        drop(mtcp_peer);
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bridge should exit after the mtcp side fails");
+        assert!(result.is_err(), "bridge should surface the mtcp failure");
+
+        drop(app_side);
+        Ok(())
+    }
 }

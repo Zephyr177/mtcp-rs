@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use crate::protocol::{
 
 const WRITE_CHANNEL_DEPTH: usize = 64;
 const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SUB_CONN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct MSocket {
@@ -35,6 +36,8 @@ struct State {
     read_offset: usize,
     conns: Vec<Arc<SubConn>>,
     write_shutdown: bool,
+    closing: bool,
+    failed: Option<&'static str>,
     closed: bool,
 }
 
@@ -52,9 +55,27 @@ enum WriteMsg {
     Close,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisconnectKind {
+    Graceful,
+    Failed(&'static str),
+}
+
 impl SubConn {
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    fn send_control(&self, msg: WriteMsg) {
+        match self.sender.try_send(msg) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(msg)) => {
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    let _ = sender.send(msg);
+                });
+            }
+        }
     }
 }
 
@@ -71,6 +92,8 @@ impl MSocket {
                     read_offset: 0,
                     conns: Vec::new(),
                     write_shutdown: false,
+                    closing: false,
+                    failed: None,
                     closed: false,
                 }),
                 read_cv: Condvar::new(),
@@ -132,7 +155,8 @@ impl MSocket {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.inner.state.lock().unwrap().closed
+        let state = self.inner.state.lock().unwrap();
+        state.closed || state.closing || state.failed.is_some()
     }
 
     pub fn wait_closed(&self) {
@@ -148,6 +172,9 @@ impl MSocket {
             if state.write_shutdown {
                 return Ok(());
             }
+            if state.failed.is_some() || state.closing {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "msocket is closing"));
+            }
             state.write_shutdown = true;
             state
                 .conns
@@ -158,7 +185,7 @@ impl MSocket {
         };
 
         for conn in conns {
-            let _ = conn.sender.send(WriteMsg::Shutdown);
+            conn.send_control(WriteMsg::Shutdown);
         }
 
         Ok(())
@@ -167,7 +194,16 @@ impl MSocket {
     pub fn close(&self) {
         let conns = {
             let mut state = self.inner.state.lock().unwrap();
+            if state.closing {
+                return;
+            }
             state.write_shutdown = true;
+            state.closing = true;
+            self.inner.read_cv.notify_all();
+            if state.conns.is_empty() {
+                state.closed = true;
+                self.inner.closed_cv.notify_all();
+            }
             state
                 .conns
                 .iter()
@@ -177,7 +213,7 @@ impl MSocket {
         };
 
         for conn in conns {
-            let _ = conn.sender.send(WriteMsg::Close);
+            conn.send_control(WriteMsg::Close);
         }
     }
 
@@ -211,6 +247,7 @@ impl MSocket {
     }
 
     pub(crate) fn attach_stream(&self, stream: TcpStream, cid: u16) -> io::Result<()> {
+        let _ = stream.set_write_timeout(Some(SUB_CONN_WRITE_TIMEOUT));
         let reader = stream.try_clone()?;
         let (sender, receiver) = sync_channel(WRITE_CHANNEL_DEPTH);
         let sub_conn = Arc::new(SubConn {
@@ -243,17 +280,49 @@ impl MSocket {
     }
 
     fn mark_connection_closed(&self, conn: &Arc<SubConn>) {
+        self.mark_connection_closed_with_reason(conn, DisconnectKind::Graceful);
+    }
+
+    fn mark_connection_closed_with_reason(&self, conn: &Arc<SubConn>, kind: DisconnectKind) {
         if !conn.alive.swap(false, Ordering::AcqRel) {
             return;
         }
 
-        let mut state = self.inner.state.lock().unwrap();
-        state.conns.retain(|candidate| candidate.is_alive());
-        if state.conns.is_empty() {
-            state.closed = true;
-            self.inner.closed_cv.notify_all();
+        let pending_close = {
+            let mut state = self.inner.state.lock().unwrap();
+            state.conns.retain(|candidate| candidate.is_alive());
+
+            if !state.closing && state.failed.is_none() {
+                if let DisconnectKind::Failed(reason) = kind {
+                    state.failed = Some(reason);
+                    state.write_shutdown = true;
+                } else if !state.conns.is_empty() {
+                    state.failed = Some("mtcp sub-connection dropped while tunnel was active");
+                    state.write_shutdown = true;
+                }
+            }
+
+            if state.conns.is_empty() {
+                state.closed = true;
+                self.inner.closed_cv.notify_all();
+            }
+            self.inner.read_cv.notify_all();
+
+            if state.failed.is_some() {
+                state
+                    .conns
+                    .iter()
+                    .filter(|candidate| candidate.is_alive())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+
+        for pending in pending_close {
+            pending.send_control(WriteMsg::Close);
         }
-        self.inner.read_cv.notify_all();
     }
 
     fn write_buffer(&self, mut bytes: &[u8]) -> io::Result<()> {
@@ -261,7 +330,7 @@ impl MSocket {
             let chunk_len = bytes.len().min(MAX_FRAME_PAYLOAD);
             let pid = {
                 let mut state = self.inner.state.lock().unwrap();
-                if state.write_shutdown {
+                if state.write_shutdown || state.closing || state.failed.is_some() {
                     return Err(io::Error::new(
                         ErrorKind::BrokenPipe,
                         "msocket write side is closed",
@@ -288,7 +357,7 @@ impl MSocket {
                 let mut state = self.inner.state.lock().unwrap();
                 state.conns.retain(|candidate| candidate.is_alive());
 
-                if state.write_shutdown {
+                if state.write_shutdown || state.closing || state.failed.is_some() {
                     return Err(io::Error::new(
                         ErrorKind::BrokenPipe,
                         "msocket write side is closed",
@@ -359,6 +428,14 @@ impl Read for MSocket {
                 continue;
             }
 
+            if let Some(reason) = state.failed {
+                return Err(io::Error::new(ErrorKind::ConnectionAborted, reason));
+            }
+
+            if state.closing {
+                return Ok(0);
+            }
+
             state.conns.retain(|conn| conn.is_alive());
             if state.conns.is_empty() {
                 state.closed = true;
@@ -388,13 +465,17 @@ impl Write for MSocket {
 fn reader_loop(mut stream: TcpStream, socket: MSocket, conn: Arc<SubConn>) {
     let mut buffered = Vec::with_capacity(16 * 1024);
     let mut read_buf = [0u8; 16 * 1024];
+    let mut disconnect = DisconnectKind::Graceful;
 
     loop {
         let bytes_read = match stream.read(&mut read_buf) {
             Ok(0) => break,
             Ok(bytes_read) => bytes_read,
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => {
+                disconnect = DisconnectKind::Failed("mtcp read loop aborted unexpectedly");
+                break;
+            }
         };
 
         buffered.extend_from_slice(&read_buf[..bytes_read]);
@@ -412,7 +493,11 @@ fn reader_loop(mut stream: TcpStream, socket: MSocket, conn: Arc<SubConn>) {
         }
     }
 
-    socket.mark_connection_closed(&conn);
+    if !buffered.is_empty() {
+        disconnect = DisconnectKind::Failed("mtcp received an incomplete frame");
+    }
+
+    socket.mark_connection_closed_with_reason(&conn, disconnect);
 }
 
 fn writer_loop(
@@ -421,6 +506,8 @@ fn writer_loop(
     conn: Arc<SubConn>,
     receiver: Receiver<WriteMsg>,
 ) {
+    let mut disconnect = DisconnectKind::Graceful;
+
     loop {
         let msg = match receiver.recv_timeout(WRITER_POLL_INTERVAL) {
             Ok(msg) => msg,
@@ -440,6 +527,7 @@ fn writer_loop(
                 let result = stream.write_all(&frame);
                 conn.queued_bytes.fetch_sub(frame_len, Ordering::AcqRel);
                 if result.is_err() {
+                    disconnect = DisconnectKind::Failed("mtcp write loop aborted unexpectedly");
                     break;
                 }
             }
@@ -453,7 +541,7 @@ fn writer_loop(
         }
     }
 
-    socket.mark_connection_closed(&conn);
+    socket.mark_connection_closed_with_reason(&conn, disconnect);
 }
 
 struct ServerState {
@@ -578,9 +666,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::protocol::encode_frame;
     use super::MSocket;
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -616,6 +707,43 @@ mod tests {
             }
         }
 
+        socket.wait_closed();
+        Ok(())
+    }
+
+    #[test]
+    fn missing_frame_after_sub_connection_drop_returns_error() -> io::Result<()> {
+        let socket = MSocket::from_server(1);
+
+        let listener_a = TcpListener::bind("127.0.0.1:0")?;
+        let addr_a = listener_a.local_addr()?;
+        let client_a = TcpStream::connect(addr_a)?;
+        let (server_a, _) = listener_a.accept()?;
+        socket.attach_stream(client_a, 1)?;
+
+        let listener_b = TcpListener::bind("127.0.0.1:0")?;
+        let addr_b = listener_b.local_addr()?;
+        let client_b = TcpStream::connect(addr_b)?;
+        let (mut server_b, _) = listener_b.accept()?;
+        socket.attach_stream(client_b, 2)?;
+
+        server_b.write_all(&encode_frame(1, b"blocked"))?;
+        drop(server_a);
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut reader = socket.clone();
+        thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            let _ = tx.send(reader.read(&mut buf).map(|_| ()));
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("msocket read should not block indefinitely");
+        let err = result.expect_err("expected a read error after sub-connection loss");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+
+        drop(server_b);
         socket.wait_closed();
         Ok(())
     }

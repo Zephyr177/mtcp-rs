@@ -1,11 +1,15 @@
 use std::io;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::connection::{serve_mtcp_listener, MSocket};
+
+const TCP_COPY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -206,10 +210,13 @@ fn bridge_tcp_and_mtcp(stream: TcpStream, socket: MSocket) -> io::Result<()> {
     let mut mtcp_writer = socket.clone();
     let mut mtcp_reader = socket.clone();
     let (result_tx, result_rx) = mpsc::sync_channel(2);
+    let stop_tcp_reader = Arc::new(AtomicBool::new(false));
 
     let forward_tx = result_tx.clone();
+    let forward_stop = stop_tcp_reader.clone();
     let forward = thread::spawn(move || {
-        let result = io::copy(&mut tcp_reader, &mut mtcp_writer);
+        let _ = tcp_reader.set_read_timeout(Some(TCP_COPY_POLL_INTERVAL));
+        let result = copy_tcp_to_mtcp(&mut tcp_reader, &mut mtcp_writer, &forward_stop);
         let _ = mtcp_writer.shutdown_write();
         let _ = forward_tx.send(result.map(|_| ()));
     });
@@ -226,6 +233,7 @@ fn bridge_tcp_and_mtcp(stream: TcpStream, socket: MSocket) -> io::Result<()> {
     let mut error = first_result.err();
 
     if error.is_some() {
+        stop_tcp_reader.store(true, Ordering::Release);
         socket.close();
         let _ = tcp_control.shutdown(Shutdown::Both);
     }
@@ -250,6 +258,32 @@ fn join_copy_thread(handle: thread::JoinHandle<()>, label: &str) -> io::Result<(
     handle
         .join()
         .map_err(|_| io::Error::other(format!("bridge thread panicked while copying {label}")))
+}
+
+fn copy_tcp_to_mtcp(
+    reader: &mut TcpStream,
+    writer: &mut MSocket,
+    stop: &AtomicBool,
+) -> io::Result<u64> {
+    let mut total = 0u64;
+    let mut buf = [0u8; 16 * 1024];
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(bytes_read) => {
+                writer.write_all(&buf[..bytes_read])?;
+                total += bytes_read as u64;
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(total);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]
